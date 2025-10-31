@@ -9,15 +9,15 @@ Repósitorio do primeiro Tech Challenge da Pós Tech da FIAP.
 
 webscraping-tech-challenge/
 ├─ api/
-│  ├─ v1.py                # FastAPI (endpoints + JWT + stats + ML)
+│  ├─ v1.py                
 │  ├─ __init__.py
 ├─ scripts/
-│  ├─ scrape_books.py      # Web scraping -> data/books.csv
+│  ├─ scrape_books.py      
 │  ├─ __init__.py
 ├─ data/
-│  └─ books.csv            # Gerado pelo scraper (pequeno, pode versionar)
+│  └─ books.csv           
 ├─ docs/
-│  └─ architecture.md      # Diagrama + decisões
+│  └─ architecture.md 
 ├─ tests/
 │  └─ test_api.py
 ├─ .gitignore
