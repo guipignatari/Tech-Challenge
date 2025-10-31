@@ -2,12 +2,12 @@ import os
 import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
-
 from datetime import datetime, timedelta, timezone
 
 import jwt
 import pandas as pd
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------------------
@@ -22,14 +22,20 @@ app = FastAPI(
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
-DATA_CSV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "books.csv"))
+DATA_CSV_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "books.csv")
+)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 JWT_ALG = "HS256"
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
-ALLOW_SCRAPER_WRITE = os.getenv("ALLOW_SCRAPER_WRITE", "false").lower() in {"1", "true", "yes"}
+ALLOW_SCRAPER_WRITE = os.getenv("ALLOW_SCRAPER_WRITE", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # ------------------------------------------------------------------------------
 # Auth models
@@ -69,16 +75,27 @@ def decode_token(token: str) -> Dict[str, Any]:
     )
 
 
-def bearer_auth(authorization: Optional[str] = Header(None)) -> str:
-    if not authorization:
+# ------------------------------------------------------------------------------
+# Bearer auth (publica o esquema no OpenAPI -> botão "Authorize" aparece)
+# ------------------------------------------------------------------------------
+bearer_scheme = HTTPBearer(auto_error=False)
+
+def bearer_auth(
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> str:
+    if credentials is None or (credentials.scheme or "").lower() != "bearer":
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
+
+    token = (credentials.credentials or "").strip()
+    if not token:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = token.strip()  # remove espaços/quebras de linha
+
     try:
         decoded = decode_token(token)
-        return decoded.get("sub", "")
+        sub = decoded.get("sub", "")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        return sub
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -93,7 +110,16 @@ def bearer_auth(authorization: Optional[str] = Header(None)) -> str:
 def _read_csv() -> pd.DataFrame:
     if not os.path.exists(DATA_CSV_PATH):
         # CSV ausente: retorna DF vazio com colunas esperadas
-        cols = ["id", "title", "price", "rating", "availability", "category", "image_url", "product_page_url"]
+        cols = [
+            "id",
+            "title",
+            "price",
+            "rating",
+            "availability",
+            "category",
+            "image_url",
+            "product_page_url",
+        ]
         return pd.DataFrame(columns=cols)
     df = pd.read_csv(DATA_CSV_PATH)
     # tipos básicos
@@ -126,7 +152,10 @@ def health():
 @app.get("/api/v1/books")
 def list_books(
     limit: int = Query(50, ge=1, le=1000),
-    order_by: str = Query("id", description="Campo para ordenar (id, title, price, rating, availability)"),
+    order_by: str = Query(
+        "id",
+        description="Campo para ordenar (id, title, price, rating, availability)",
+    ),
     order: str = Query("asc", description="asc|desc"),
     category: Optional[str] = Query(None, description="Filtra por categoria exata"),
 ):
@@ -153,7 +182,9 @@ def get_book(book_id: int):
 
 @app.get("/api/v1/books/search")
 def search_books(
-    title: Optional[str] = Query(None, description="Busca por substring no título (case-insensitive)"),
+    title: Optional[str] = Query(
+        None, description="Busca por substring no título (case-insensitive)"
+    ),
     category: Optional[str] = Query(None, description="Filtra por categoria exata"),
 ):
     df = load_df()
@@ -217,7 +248,7 @@ def stats_categories():
 # ------------------------------------------------------------------------------
 # Auth endpoints (Desafio 1)
 # ------------------------------------------------------------------------------
-@app.post("/api/v1/auth/login", response_model=TokenOut)
+@app.post("/api/v1/auth/login", response_model=TokenOut, tags=["auth"])
 def login(payload: LoginIn):
     if payload.username != ADMIN_USER or payload.password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -225,13 +256,13 @@ def login(payload: LoginIn):
     return TokenOut(access_token=token, expires_in=60 * 60)
 
 
-@app.post("/api/v1/auth/refresh", response_model=TokenOut)
+@app.post("/api/v1/auth/refresh", response_model=TokenOut, tags=["auth"])
 def refresh_token(_: str = Depends(bearer_auth)):
     token = create_token(sub=ADMIN_USER, minutes=60)
     return TokenOut(access_token=token, expires_in=60 * 60)
 
 
-@app.get("/api/v1/auth/whoami")
+@app.get("/api/v1/auth/whoami", tags=["auth"])
 def whoami(user: str = Depends(bearer_auth)):
     return {"user": user}
 
@@ -255,8 +286,12 @@ def scraping_trigger(
     ),
     verbose: bool = Query(False, description="Exibe logs detalhados no servidor."),
     delay: float = Query(0.25, ge=0.0, le=2.0, description="Atraso entre requisições (segundos)."),
-    retries: int = Query(4, ge=0, le=10, description="Tentativas de retry por requisição (além do retry da sessão HTTP)."),
-    checkpoint_every: int = Query(100, ge=10, le=1000, description="Salva CSV a cada N livros (checkpoint)."),
+    retries: int = Query(
+        4, ge=0, le=10, description="Tentativas de retry por requisição (além do retry da sessão HTTP)."
+    ),
+    checkpoint_every: int = Query(
+        100, ge=10, le=1000, description="Salva CSV a cada N livros (checkpoint)."
+    ),
     resume: bool = Query(True, description="Retoma do CSV existente, pulando o que já foi coletado."),
 ):
     if not ALLOW_SCRAPER_WRITE:
