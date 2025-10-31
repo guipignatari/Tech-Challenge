@@ -1,0 +1,26 @@
+# webscraping-tech-challenge
+Repósitorio do primeiro Tech Challenge da Pós Tech da FIAP.
+
+- Descrição do projeto e arquitetura.
+- Instruções de instalação e configuração.
+- Documentação das rotas da API.
+- Exemplos de chamadas com requests/responses.
+- Instruções para execução.
+
+webscraping-tech-challenge/
+├─ api/
+│  ├─ v1.py                # FastAPI (endpoints + JWT + stats + ML)
+│  ├─ __init__.py
+├─ scripts/
+│  ├─ scrape_books.py      # Web scraping -> data/books.csv
+│  ├─ __init__.py
+├─ data/
+│  └─ books.csv            # Gerado pelo scraper (pequeno, pode versionar)
+├─ docs/
+│  └─ architecture.md      # Diagrama + decisões
+├─ tests/
+│  └─ test_api.py
+├─ .gitignore
+├─ requirements.txt
+├─ vercel.json
+└─ README.md

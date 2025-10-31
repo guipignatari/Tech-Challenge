@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Pacotes/Build
+build/
+dist/
+*.egg-info/
+
+# IDEs/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs (mantém data/books.csv versionado)
+logs/
