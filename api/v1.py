@@ -10,6 +10,8 @@ import jwt
 import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi.responses import RedirectResponse
+
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------------------
@@ -124,6 +126,9 @@ def health():
         "last_check": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    return RedirectResponse(url="/docs")
 
 @app.get("/api/v1/books")
 def list_books(
