@@ -1,13 +1,15 @@
+# api/v1.py
 import os
+import io
 import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 
 import jwt
+import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------------------
@@ -22,20 +24,14 @@ app = FastAPI(
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
-DATA_CSV_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "data", "books.csv")
-)
+DATA_CSV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "books.csv"))
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 JWT_ALG = "HS256"
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
-ALLOW_SCRAPER_WRITE = os.getenv("ALLOW_SCRAPER_WRITE", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-}
+ALLOW_SCRAPER_WRITE = os.getenv("ALLOW_SCRAPER_WRITE", "false").lower() in {"1", "true", "yes"}
 
 # ------------------------------------------------------------------------------
 # Auth models
@@ -75,27 +71,16 @@ def decode_token(token: str) -> Dict[str, Any]:
     )
 
 
-# ------------------------------------------------------------------------------
-# Bearer auth (publica o esquema no OpenAPI -> botão "Authorize" aparece)
-# ------------------------------------------------------------------------------
-bearer_scheme = HTTPBearer(auto_error=False)
-
-def bearer_auth(
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
-) -> str:
-    if credentials is None or (credentials.scheme or "").lower() != "bearer":
+def bearer_auth(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    token = (credentials.credentials or "").strip()
-    if not token:
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
+    token = token.strip()  # remove espaços/quebras de linha
     try:
         decoded = decode_token(token)
-        sub = decoded.get("sub", "")
-        if not sub:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-        return sub
+        return decoded.get("sub", "")
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -110,16 +95,7 @@ def bearer_auth(
 def _read_csv() -> pd.DataFrame:
     if not os.path.exists(DATA_CSV_PATH):
         # CSV ausente: retorna DF vazio com colunas esperadas
-        cols = [
-            "id",
-            "title",
-            "price",
-            "rating",
-            "availability",
-            "category",
-            "image_url",
-            "product_page_url",
-        ]
+        cols = ["id", "title", "price", "rating", "availability", "category", "image_url", "product_page_url"]
         return pd.DataFrame(columns=cols)
     df = pd.read_csv(DATA_CSV_PATH)
     # tipos básicos
@@ -152,10 +128,7 @@ def health():
 @app.get("/api/v1/books")
 def list_books(
     limit: int = Query(50, ge=1, le=1000),
-    order_by: str = Query(
-        "id",
-        description="Campo para ordenar (id, title, price, rating, availability)",
-    ),
+    order_by: str = Query("id", description="Campo para ordenar (id, title, price, rating, availability)"),
     order: str = Query("asc", description="asc|desc"),
     category: Optional[str] = Query(None, description="Filtra por categoria exata"),
 ):
@@ -182,9 +155,7 @@ def get_book(book_id: int):
 
 @app.get("/api/v1/books/search")
 def search_books(
-    title: Optional[str] = Query(
-        None, description="Busca por substring no título (case-insensitive)"
-    ),
+    title: Optional[str] = Query(None, description="Busca por substring no título (case-insensitive)"),
     category: Optional[str] = Query(None, description="Filtra por categoria exata"),
 ):
     df = load_df()
@@ -248,7 +219,7 @@ def stats_categories():
 # ------------------------------------------------------------------------------
 # Auth endpoints (Desafio 1)
 # ------------------------------------------------------------------------------
-@app.post("/api/v1/auth/login", response_model=TokenOut, tags=["auth"])
+@app.post("/api/v1/auth/login", response_model=TokenOut)
 def login(payload: LoginIn):
     if payload.username != ADMIN_USER or payload.password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -256,13 +227,13 @@ def login(payload: LoginIn):
     return TokenOut(access_token=token, expires_in=60 * 60)
 
 
-@app.post("/api/v1/auth/refresh", response_model=TokenOut, tags=["auth"])
+@app.post("/api/v1/auth/refresh", response_model=TokenOut)
 def refresh_token(_: str = Depends(bearer_auth)):
     token = create_token(sub=ADMIN_USER, minutes=60)
     return TokenOut(access_token=token, expires_in=60 * 60)
 
 
-@app.get("/api/v1/auth/whoami", tags=["auth"])
+@app.get("/api/v1/auth/whoami")
 def whoami(user: str = Depends(bearer_auth)):
     return {"user": user}
 
@@ -286,12 +257,8 @@ def scraping_trigger(
     ),
     verbose: bool = Query(False, description="Exibe logs detalhados no servidor."),
     delay: float = Query(0.25, ge=0.0, le=2.0, description="Atraso entre requisições (segundos)."),
-    retries: int = Query(
-        4, ge=0, le=10, description="Tentativas de retry por requisição (além do retry da sessão HTTP)."
-    ),
-    checkpoint_every: int = Query(
-        100, ge=10, le=1000, description="Salva CSV a cada N livros (checkpoint)."
-    ),
+    retries: int = Query(4, ge=0, le=10, description="Tentativas de retry por requisição (além do retry da sessão HTTP)."),
+    checkpoint_every: int = Query(100, ge=10, le=1000, description="Salva CSV a cada N livros (checkpoint)."),
     resume: bool = Query(True, description="Retoma do CSV existente, pulando o que já foi coletado."),
 ):
     if not ALLOW_SCRAPER_WRITE:
@@ -328,3 +295,269 @@ def scraping_trigger(
         "checkpoint_every": checkpoint_every,
         "resume": resume,
     }
+
+
+# ==============================================================================
+# ============================  ML-READY (BÔNUS)  ===============================
+# ==============================================================================
+
+# ---------- Helpers de features ----------
+
+def _prepare_base(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Seleciona colunas relevantes e garante tipos.
+    """
+    need = ["id", "title", "price", "rating", "availability", "category"]
+    for col in need:
+        if col not in df.columns:
+            df[col] = np.nan
+    base = df[need].copy()
+    base["title"] = base["title"].fillna("")
+    base["title_len"] = base["title"].astype(str).str.len().astype(float)
+    base["rating"] = pd.to_numeric(base["rating"], errors="coerce")
+    base["availability"] = pd.to_numeric(base["availability"], errors="coerce")
+    base["price"] = pd.to_numeric(base["price"], errors="coerce")
+    base["category"] = base["category"].astype(str).replace({"nan": ""})
+    return base.dropna(subset=["rating", "availability"])
+
+
+def _category_to_index(series: pd.Series) -> Dict[str, int]:
+    """
+    Mapeia categorias para índices estáveis (ordenados alfabeticamente).
+    """
+    cats = sorted([c for c in series.dropna().unique().tolist()])
+    return {c: i for i, c in enumerate(cats)}
+
+
+def _minmax(s: pd.Series) -> pd.Series:
+    s = s.astype(float)
+    mn, mx = float(s.min()), float(s.max())
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - mn) / (mx - mn)
+
+
+def _build_features(df: pd.DataFrame, normalized: bool = True) -> pd.DataFrame:
+    """
+    Constrói um DF de features consistente.
+    feature_cols (para treino/pred): rating, availability, category_idx, title_len
+    Se normalized=True, adiciona rating_norm/availability_norm e usa-as em 'features_norm_*'.
+    """
+    base = _prepare_base(df)
+
+    cat2idx = _category_to_index(base["category"])
+    base["category_idx"] = base["category"].map(cat2idx).fillna(-1).astype(int)
+
+    # normalizações simples (min-max)
+    base["rating_norm"] = _minmax(base["rating"])
+    base["availability_norm"] = _minmax(base["availability"])
+
+    # conjunto de features "cruas"
+    base["f_rating"] = base["rating"].astype(float)
+    base["f_availability"] = base["availability"].astype(float)
+    base["f_category_idx"] = base["category_idx"].astype(float)
+    base["f_title_len"] = base["title_len"].astype(float)
+
+    # conjunto de features "normalizadas"
+    base["fn_rating"] = base["rating_norm"].astype(float)
+    base["fn_availability"] = base["availability_norm"].astype(float)
+    base["fn_category_idx"] = base["f_category_idx"]  # categórica já está em índice
+    base["fn_title_len"] = _minmax(base["title_len"])
+
+    # quais usar
+    if normalized:
+        used = ["fn_rating", "fn_availability", "fn_category_idx", "fn_title_len"]
+    else:
+        used = ["f_rating", "f_availability", "f_category_idx", "f_title_len"]
+
+    out = base[
+        ["id", "title", "category", "price", "rating", "availability", "title_len", "category_idx",
+         "rating_norm", "availability_norm"] + used
+    ].copy()
+
+    out.rename(
+        columns={
+            "fn_rating": "x_rating",
+            "fn_availability": "x_availability",
+            "fn_category_idx": "x_category_idx",
+            "fn_title_len": "x_title_len",
+            "f_rating": "x_rating",
+            "f_availability": "x_availability",
+            "f_category_idx": "x_category_idx",
+            "f_title_len": "x_title_len",
+        },
+        inplace=True,
+    )
+    return out
+
+
+def _fit_linear_regression(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    Ajusta uma regressão linear simples por mínimos quadrados.
+    Retorna vetor de coeficientes beta (incluindo intercepto).
+    """
+    # adiciona intercepto
+    ones = np.ones((X.shape[0], 1), dtype=float)
+    Xb = np.hstack([ones, X])
+    try:
+        beta, *_ = np.linalg.lstsq(Xb, y, rcond=None)
+        return beta  # shape: (n_features+1,)
+    except Exception:
+        # fallback: zeros (intercepto = média)
+        return np.array([float(np.nanmean(y))] + [0.0] * X.shape[1], dtype=float)
+
+
+# ---------- Modelos p/ predição ----------
+
+class MLItem(BaseModel):
+    rating: float
+    availability: float
+    category: Optional[str] = None
+    title: Optional[str] = None
+
+
+class MLPredRequest(BaseModel):
+    items: List[MLItem]
+    normalized: bool = True  # usar o mesmo espaço de features dos endpoints de treino
+
+
+class MLPrediction(BaseModel):
+    predicted_price: float
+    features: Dict[str, float]
+
+
+class MLPredResponse(BaseModel):
+    model: Dict[str, Any]
+    predictions: List[MLPrediction]
+
+
+# ---------- Endpoints ML ----------
+
+@app.get("/api/v1/ml/features", tags=["ml"])
+def ml_features(
+    normalized: bool = Query(True, description="Usa colunas normalizadas (min-max)."),
+    limit: int = Query(1000, ge=1, le=10000),
+    format: str = Query("json", pattern="^(json|csv)$"),
+    include_id: bool = Query(True),
+):
+    """
+    Subconjunto de features limpas/normalizadas para consumo por modelos.
+    Retorna colunas: (id opcional), x_rating, x_availability, x_category_idx, x_title_len.
+    """
+    df = load_df()
+    feats = _build_features(df, normalized=normalized)
+    used = ["x_rating", "x_availability", "x_category_idx", "x_title_len"]
+    cols = (["id"] if include_id else []) + used
+    feats = feats[cols].head(limit)
+
+    if format == "csv":
+        buf = io.StringIO()
+        feats.to_csv(buf, index=False)
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'inline; filename="features.csv"'},
+        )
+    return feats.to_dict(orient="records")
+
+
+@app.get("/api/v1/ml/training-data", tags=["ml"])
+def ml_training_data(
+    normalized: bool = Query(True, description="Usa colunas normalizadas (min-max)."),
+    limit: int = Query(1000, ge=1, le=10000),
+    format: str = Query("json", pattern="^(json|csv)$"),
+):
+    """
+    Retorna dataset de treino: features + target (price).
+    Features: x_rating, x_availability, x_category_idx, x_title_len
+    Target: price
+    """
+    df = load_df()
+    feats = _build_features(df, normalized=normalized)
+    used = ["x_rating", "x_availability", "x_category_idx", "x_title_len", "price"]
+    data = feats[used].dropna(subset=["price"]).head(limit)
+
+    if format == "csv":
+        buf = io.StringIO()
+        data.to_csv(buf, index=False)
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'inline; filename="training_data.csv"'},
+        )
+    return data.to_dict(orient="records")
+
+
+@app.post("/api/v1/ml/predictions", response_model=MLPredResponse, tags=["ml"])
+def ml_predictions(payload: MLPredRequest):
+    """
+    Predição mock:
+    - Ajusta uma regressão linear simples (em memória) usando o dataset atual.
+    - Se não der para ajustar (poucos dados), usa um fallback heurístico.
+    - As features usadas devem estar no mesmo espaço (normalized=True/False) escolhido no payload.
+    """
+    df = load_df()
+    feats = _build_features(df, normalized=payload.normalized).dropna(subset=["price"])
+    used = ["x_rating", "x_availability", "x_category_idx", "x_title_len"]
+
+    # Dados para treino
+    train = feats[used + ["price"]].dropna()
+    if train.shape[0] >= 15:
+        X = train[used].to_numpy(dtype=float)
+        y = train["price"].to_numpy(dtype=float)
+        beta = _fit_linear_regression(X, y)  # [intercept, b1, b2, b3, b4]
+        model_info = {"type": "ols", "coefficients": beta.tolist(), "normalized": payload.normalized}
+    else:
+        # fallback: intercepto = mediana; pesos simples
+        median_price = float(np.nanmedian(train["price"])) if train.shape[0] else 40.0
+        beta = np.array([median_price, 10.0, 1.0, 0.5, 0.02], dtype=float)
+        model_info = {"type": "fallback", "coefficients": beta.tolist(), "normalized": payload.normalized}
+
+    # Mapeamento de categoria -> idx baseado no dataset atual (mesmo do treino)
+    cat2idx = _category_to_index(_prepare_base(df)["category"])
+
+    # Monta feature row para cada item de entrada
+    preds: List[MLPrediction] = []
+    for it in payload.items:
+        title_len = float(len(it.title or ""))
+        cat_idx = float(cat2idx.get((it.category or ""), -1))
+
+        if payload.normalized:
+            # normaliza com base no dataset atual
+            # (min-max das colunas originais presentes em feats)
+            r_min, r_max = float(feats["rating"].min()), float(feats["rating"].max())
+            a_min, a_max = float(feats["availability"].min()), float(feats["availability"].max())
+            tl_min, tl_max = float(feats["title_len"].min()), float(feats["title_len"].max())
+
+            def _mm(x, mn, mx):
+                if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+                    return 0.0
+                return float((x - mn) / (mx - mn))
+
+            x_row = np.array(
+                [
+                    _mm(it.rating, r_min, r_max),
+                    _mm(it.availability, a_min, a_max),
+                    cat_idx,  # categórica como índice
+                    _mm(title_len, tl_min, tl_max),
+                ],
+                dtype=float,
+            )
+        else:
+            x_row = np.array([float(it.rating), float(it.availability), cat_idx, title_len], dtype=float)
+
+        # y = beta0 + beta1*x1 + ... + beta4*x4
+        y_hat = float(beta[0] + np.dot(beta[1:], x_row))
+        preds.append(
+            MLPrediction(
+                predicted_price=max(y_hat, 0.0),
+                features={
+                    "x_rating": float(x_row[0]),
+                    "x_availability": float(x_row[1]),
+                    "x_category_idx": float(x_row[2]),
+                    "x_title_len": float(x_row[3]),
+                },
+            )
+        )
+
+    return MLPredResponse(model=model_info, predictions=preds)
