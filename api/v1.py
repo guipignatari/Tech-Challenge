@@ -9,9 +9,8 @@ from datetime import datetime, timedelta, timezone
 import jwt
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, Security
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import RedirectResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------------------
@@ -63,6 +62,7 @@ def create_token(sub: str, minutes: int = 60) -> str:
 
 
 def decode_token(token: str) -> Dict[str, Any]:
+    # tolera pequenos drifts de relógio e ignora validação estrita de iat
     return jwt.decode(
         token,
         SECRET_KEY,
@@ -72,22 +72,13 @@ def decode_token(token: str) -> Dict[str, Any]:
     )
 
 
-# ------------------------------------------------------------------------------
-# Security scheme (faz o cadeado aparecer no Swagger)
-# ------------------------------------------------------------------------------
-bearer_scheme = HTTPBearer(auto_error=False)
-
-def bearer_auth(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)) -> str:
-    """
-    Valida o header Authorization via HTTP Bearer (Security).
-    Retorna o 'sub' do token se estiver ok.
-    """
-    if credentials is None:
+def bearer_auth(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-    if (credentials.scheme or "").lower() != "bearer" or not credentials.credentials:
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = credentials.credentials.strip()
+    token = token.strip()  # remove espaços/quebras de linha
     try:
         decoded = decode_token(token)
         return decoded.get("sub", "")
@@ -104,9 +95,11 @@ def bearer_auth(credentials: HTTPAuthorizationCredentials = Security(bearer_sche
 # ------------------------------------------------------------------------------
 def _read_csv() -> pd.DataFrame:
     if not os.path.exists(DATA_CSV_PATH):
+        # CSV ausente: retorna DF vazio com colunas esperadas
         cols = ["id", "title", "price", "rating", "availability", "category", "image_url", "product_page_url"]
         return pd.DataFrame(columns=cols)
     df = pd.read_csv(DATA_CSV_PATH)
+    # tipos básicos
     for col in ["id", "rating", "availability"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -132,9 +125,14 @@ def health():
         "last_check": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
+
 @app.get("/", include_in_schema=False)
 def root_redirect():
     return RedirectResponse(url="/docs")
+
+
+# --- Books (ATENÇÃO à ordem das rotas) ----------------------------------------
+# As rotas estáticas devem vir ANTES de /api/v1/books/{book_id} para evitar 422.
 
 @app.get("/api/v1/books")
 def list_books(
@@ -153,6 +151,45 @@ def list_books(
     if limit:
         df = df.head(limit)
     return df.to_dict(orient="records")
+
+
+@app.get("/api/v1/books/top-rated")
+def top_rated_books(
+    limit: int = Query(50, ge=1, le=1000),
+    min_rating: int = Query(5, ge=0, le=5, description="Filtra livros com rating >= min_rating"),
+    category: Optional[str] = Query(None, description="Filtra por categoria exata"),
+):
+    """Lista os livros com maior avaliação (rating)."""
+    df = load_df()
+    if "rating" not in df.columns:
+        return []
+    df = df[pd.to_numeric(df["rating"], errors="coerce").fillna(0) >= min_rating]
+    if category:
+        df = df[df["category"] == category]
+    df = df.sort_values(by=["rating", "price"], ascending=[False, True])
+    return df.head(limit).to_dict(orient="records")
+
+
+@app.get("/api/v1/books/price-range")
+def books_price_range(
+    min: float = Query(0.0, description="Preço mínimo"),
+    max: float = Query(9999.0, description="Preço máximo"),
+    limit: int = Query(50, ge=1, le=1000),
+    order_by: str = Query("price", description="id|title|price|rating|availability"),
+    order: str = Query("asc", description="asc|desc"),
+    category: Optional[str] = Query(None, description="Filtra por categoria exata"),
+):
+    """Filtra livros dentro de uma faixa de preço específica."""
+    df = load_df()
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df[(df["price"] >= float(min)) & (df["price"] <= float(max))]
+    if category:
+        df = df[df["category"] == category]
+    if order_by not in df.columns:
+        order_by = "price"
+    ascending = order.lower() != "desc"
+    df = df.sort_values(by=order_by, ascending=ascending)
+    return df.head(limit).to_dict(orient="records")
 
 
 @app.get("/api/v1/books/{book_id}")
@@ -186,7 +223,6 @@ def list_categories():
     return cats
 
 
-# -------------------- Insights --------------------
 @app.get("/api/v1/stats/overview")
 def stats_overview():
     df = load_df()
@@ -223,54 +259,15 @@ def stats_categories():
                 "avg_rating": float(g["rating"].mean()),
             }
         )
-    return sorted(out, key=lambda x: (x["category"] or ""))
-
-
-# -------------------- Opcionais solicitados --------------------
-@app.get("/api/v1/books/top-rated")
-def top_rated_books(
-    limit: int = Query(10, ge=1, le=1000),
-    min_rating: float = Query(0, ge=0, le=5),
-    category: Optional[str] = Query(None),
-):
-    """
-    Lista livros com maior rating (desc), opcionalmente filtrando por categoria e nota mínima.
-    """
-    df = load_df()
-    if category:
-        df = df[df["category"] == category]
-    df = df[pd.to_numeric(df["rating"], errors="coerce").fillna(0) >= min_rating]
-    df = df.sort_values(by=["rating", "price"], ascending=[False, False]).head(limit)
-    return df.to_dict(orient="records")
-
-
-@app.get("/api/v1/books/price-range")
-def books_price_range(
-    min: float = Query(0, description="Preço mínimo"),
-    max: float = Query(1000, description="Preço máximo"),
-    limit: int = Query(50, ge=1, le=1000),
-    order_by: str = Query("price", description="id|title|price|rating|availability"),
-    order: str = Query("asc", description="asc|desc"),
-    category: Optional[str] = Query(None),
-):
-    """
-    Filtra livros dentro de uma faixa de preço específica.
-    """
-    df = load_df()
-    if category:
-        df = df[df["category"] == category]
-    df = df[pd.to_numeric(df["price"], errors="coerce").between(min, max, inclusive="both")]
-    if order_by not in df.columns:
-        order_by = "price"
-    ascending = order.lower() != "desc"
-    df = df.sort_values(by=order_by, ascending=ascending).head(limit)
-    return df.to_dict(orient="records")
+    # ordena por categoria para estabilidade
+    out = sorted(out, key=lambda x: (x["category"] or ""))
+    return out
 
 
 # ------------------------------------------------------------------------------
 # Auth endpoints (Desafio 1)
 # ------------------------------------------------------------------------------
-@app.post("/api/v1/auth/login", response_model=TokenOut, tags=["auth"])
+@app.post("/api/v1/auth/login", response_model=TokenOut)
 def login(payload: LoginIn):
     if payload.username != ADMIN_USER or payload.password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -278,13 +275,13 @@ def login(payload: LoginIn):
     return TokenOut(access_token=token, expires_in=60 * 60)
 
 
-@app.post("/api/v1/auth/refresh", response_model=TokenOut, tags=["auth"])
+@app.post("/api/v1/auth/refresh", response_model=TokenOut)
 def refresh_token(_: str = Depends(bearer_auth)):
     token = create_token(sub=ADMIN_USER, minutes=60)
     return TokenOut(access_token=token, expires_in=60 * 60)
 
 
-@app.get("/api/v1/auth/whoami", tags=["auth"])
+@app.get("/api/v1/auth/whoami")
 def whoami(user: str = Depends(bearer_auth)):
     return {"user": user}
 
@@ -303,7 +300,9 @@ def whoami(user: str = Depends(bearer_auth)):
 )
 def scraping_trigger(
     _: str = Depends(bearer_auth),
-    limit: Optional[int] = Query(20, ge=1, le=2000, description="Quantidade máxima de livros a coletar (None = tudo)."),
+    limit: Optional[int] = Query(
+        20, ge=1, le=2000, description="Quantidade máxima de livros a coletar (None = tudo)."
+    ),
     verbose: bool = Query(False, description="Exibe logs detalhados no servidor."),
     delay: float = Query(0.25, ge=0.0, le=2.0, description="Atraso entre requisições (segundos)."),
     retries: int = Query(4, ge=0, le=10, description="Tentativas de retry por requisição (além do retry da sessão HTTP)."),
@@ -317,7 +316,8 @@ def scraping_trigger(
         }
 
     t0 = time.time()
-    from scripts.scrape_books import run as run_scraper  # import tardio
+    # Import tardio para não carregar dependências do scraper na inicialização
+    from scripts.scrape_books import run as run_scraper  # type: ignore
 
     output_csv = DATA_CSV_PATH
     run_scraper(
@@ -329,6 +329,7 @@ def scraping_trigger(
         checkpoint_every=checkpoint_every,
         resume=resume,
     )
+    # Recarrega o DF em memória
     load_df.cache_clear()
 
     return {
@@ -349,7 +350,11 @@ def scraping_trigger(
 # ==============================================================================
 
 # ---------- Helpers de features ----------
+
 def _prepare_base(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Seleciona colunas relevantes e garante tipos.
+    """
     need = ["id", "title", "price", "rating", "availability", "category"]
     for col in need:
         if col not in df.columns:
@@ -365,6 +370,9 @@ def _prepare_base(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _category_to_index(series: pd.Series) -> Dict[str, int]:
+    """
+    Mapeia categorias para índices estáveis (ordenados alfabeticamente).
+    """
     cats = sorted([c for c in series.dropna().unique().tolist()])
     return {c: i for i, c in enumerate(cats)}
 
@@ -378,26 +386,37 @@ def _minmax(s: pd.Series) -> pd.Series:
 
 
 def _build_features(df: pd.DataFrame, normalized: bool = True) -> pd.DataFrame:
+    """
+    Constrói um DF de features consistente.
+    feature_cols (para treino/pred): rating, availability, category_idx, title_len
+    Se normalized=True, adiciona rating_norm/availability_norm e usa-as em 'features_norm_*'.
+    """
     base = _prepare_base(df)
 
     cat2idx = _category_to_index(base["category"])
     base["category_idx"] = base["category"].map(cat2idx).fillna(-1).astype(int)
 
+    # normalizações simples (min-max)
     base["rating_norm"] = _minmax(base["rating"])
     base["availability_norm"] = _minmax(base["availability"])
 
+    # conjunto de features "cruas"
     base["f_rating"] = base["rating"].astype(float)
     base["f_availability"] = base["availability"].astype(float)
     base["f_category_idx"] = base["category_idx"].astype(float)
     base["f_title_len"] = base["title_len"].astype(float)
 
+    # conjunto de features "normalizadas"
     base["fn_rating"] = base["rating_norm"].astype(float)
     base["fn_availability"] = base["availability_norm"].astype(float)
-    base["fn_category_idx"] = base["f_category_idx"]
+    base["fn_category_idx"] = base["f_category_idx"]  # categórica já está em índice
     base["fn_title_len"] = _minmax(base["title_len"])
 
-    used = ["fn_rating", "fn_availability", "fn_category_idx", "fn_title_len"] if normalized \
-        else ["f_rating", "f_availability", "f_category_idx", "f_title_len"]
+    # quais usar
+    if normalized:
+        used = ["fn_rating", "fn_availability", "fn_category_idx", "fn_title_len"]
+    else:
+        used = ["f_rating", "f_availability", "f_category_idx", "f_title_len"]
 
     out = base[
         ["id", "title", "category", "price", "rating", "availability", "title_len", "category_idx",
@@ -421,16 +440,23 @@ def _build_features(df: pd.DataFrame, normalized: bool = True) -> pd.DataFrame:
 
 
 def _fit_linear_regression(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    Ajusta uma regressão linear simples por mínimos quadrados.
+    Retorna vetor de coeficientes beta (incluindo intercepto).
+    """
+    # adiciona intercepto
     ones = np.ones((X.shape[0], 1), dtype=float)
     Xb = np.hstack([ones, X])
     try:
         beta, *_ = np.linalg.lstsq(Xb, y, rcond=None)
-        return beta
+        return beta  # shape: (n_features+1,)
     except Exception:
+        # fallback: zeros (intercepto = média)
         return np.array([float(np.nanmean(y))] + [0.0] * X.shape[1], dtype=float)
 
 
 # ---------- Modelos p/ predição ----------
+
 class MLItem(BaseModel):
     rating: float
     availability: float
@@ -440,7 +466,7 @@ class MLItem(BaseModel):
 
 class MLPredRequest(BaseModel):
     items: List[MLItem]
-    normalized: bool = True
+    normalized: bool = True  # usar o mesmo espaço de features dos endpoints de treino
 
 
 class MLPrediction(BaseModel):
@@ -454,6 +480,7 @@ class MLPredResponse(BaseModel):
 
 
 # ---------- Endpoints ML ----------
+
 @app.get("/api/v1/ml/features", tags=["ml"])
 def ml_features(
     normalized: bool = Query(True, description="Usa colunas normalizadas (min-max)."),
@@ -461,6 +488,10 @@ def ml_features(
     format: str = Query("json", pattern="^(json|csv)$"),
     include_id: bool = Query(True),
 ):
+    """
+    Subconjunto de features limpas/normalizadas para consumo por modelos.
+    Retorna colunas: (id opcional), x_rating, x_availability, x_category_idx, x_title_len.
+    """
     df = load_df()
     feats = _build_features(df, normalized=normalized)
     used = ["x_rating", "x_availability", "x_category_idx", "x_title_len"]
@@ -484,6 +515,11 @@ def ml_training_data(
     limit: int = Query(1000, ge=1, le=10000),
     format: str = Query("json", pattern="^(json|csv)$"),
 ):
+    """
+    Retorna dataset de treino: features + target (price).
+    Features: x_rating, x_availability, x_category_idx, x_title_len
+    Target: price
+    """
     df = load_df()
     feats = _build_features(df, normalized=normalized)
     used = ["x_rating", "x_availability", "x_category_idx", "x_title_len", "price"]
@@ -502,29 +538,40 @@ def ml_training_data(
 
 @app.post("/api/v1/ml/predictions", response_model=MLPredResponse, tags=["ml"])
 def ml_predictions(payload: MLPredRequest):
+    """
+    Predição mock:
+    - Ajusta uma regressão linear simples (em memória) usando o dataset atual.
+    - Se não der para ajustar (poucos dados), usa um fallback heurístico.
+    - As features usadas devem estar no mesmo espaço (normalized=True/False) escolhido no payload.
+    """
     df = load_df()
     feats = _build_features(df, normalized=payload.normalized).dropna(subset=["price"])
     used = ["x_rating", "x_availability", "x_category_idx", "x_title_len"]
 
+    # Dados para treino
     train = feats[used + ["price"]].dropna()
     if train.shape[0] >= 15:
         X = train[used].to_numpy(dtype=float)
         y = train["price"].to_numpy(dtype=float)
-        beta = _fit_linear_regression(X, y)
+        beta = _fit_linear_regression(X, y)  # [intercept, b1, b2, b3, b4]
         model_info = {"type": "ols", "coefficients": beta.tolist(), "normalized": payload.normalized}
     else:
+        # fallback: intercepto = mediana; pesos simples
         median_price = float(np.nanmedian(train["price"])) if train.shape[0] else 40.0
         beta = np.array([median_price, 10.0, 1.0, 0.5, 0.02], dtype=float)
         model_info = {"type": "fallback", "coefficients": beta.tolist(), "normalized": payload.normalized}
 
+    # Mapeamento de categoria -> idx baseado no dataset atual (mesmo do treino)
     cat2idx = _category_to_index(_prepare_base(df)["category"])
 
+    # Monta feature row para cada item de entrada
     preds: List[MLPrediction] = []
     for it in payload.items:
         title_len = float(len(it.title or ""))
         cat_idx = float(cat2idx.get((it.category or ""), -1))
 
         if payload.normalized:
+            # normaliza com base no dataset atual
             r_min, r_max = float(feats["rating"].min()), float(feats["rating"].max())
             a_min, a_max = float(feats["availability"].min()), float(feats["availability"].max())
             tl_min, tl_max = float(feats["title_len"].min()), float(feats["title_len"].max())
@@ -535,12 +582,18 @@ def ml_predictions(payload: MLPredRequest):
                 return float((x - mn) / (mx - mn))
 
             x_row = np.array(
-                [_mm(it.rating, r_min, r_max), _mm(it.availability, a_min, a_max), cat_idx, _mm(title_len, tl_min, tl_max)],
+                [
+                    _mm(it.rating, r_min, r_max),
+                    _mm(it.availability, a_min, a_max),
+                    cat_idx,  # categórica como índice
+                    _mm(title_len, tl_min, tl_max),
+                ],
                 dtype=float,
             )
         else:
             x_row = np.array([float(it.rating), float(it.availability), cat_idx, title_len], dtype=float)
 
+        # y = beta0 + beta1*x1 + ... + beta4*x4
         y_hat = float(beta[0] + np.dot(beta[1:], x_row))
         preds.append(
             MLPrediction(
