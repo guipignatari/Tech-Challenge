@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 import jwt
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, Security
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------------------
@@ -72,13 +73,19 @@ def decode_token(token: str) -> Dict[str, Any]:
     )
 
 
-def bearer_auth(authorization: Optional[str] = Header(None)) -> str:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
+# ------------------------------------------------------------------------------
+# Bearer auth para Swagger (cadeado) — cola só o token no modal
+# ------------------------------------------------------------------------------
+bearer_scheme = HTTPBearer(auto_error=True)
+
+def bearer_auth(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)) -> str:
+    """
+    Valida token recebido via HTTP Bearer (Swagger 'Authorize').
+    O usuário cola apenas o token no modal; o Swagger envia 'Authorization: Bearer <token>'.
+    """
+    if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = token.strip()  # remove espaços/quebras de linha
+    token = credentials.credentials.strip()
     try:
         decoded = decode_token(token)
         return decoded.get("sub", "")
