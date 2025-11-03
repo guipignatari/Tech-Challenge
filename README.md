@@ -21,7 +21,6 @@ API e pipeline de dados para coletar livros do site **https://books.toscrape.com
 - [Exemplos de chamadas](#exemplos-de-chamadas)
 - [Testes automatizados](#testes-automatizados)
 - [Boas práticas e notas](#boas-práticas-e-notas)
-- [Licença](#licença)
 
 ---
 
